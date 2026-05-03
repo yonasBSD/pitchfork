@@ -261,9 +261,7 @@ mod tests {
             ready_http: None,
             ready_port: None,
             ready_cmd: None,
-            expected_port: Vec::new(),
-            auto_bump_port: false,
-            port_bump_attempts: 10,
+            port: None,
             boot_start: None,
             depends: depends
                 .into_iter()
@@ -279,6 +277,7 @@ mod tests {
             user: None,
             memory_limit: None,
             cpu_limit: None,
+            stop_signal: None,
         }
     }
 

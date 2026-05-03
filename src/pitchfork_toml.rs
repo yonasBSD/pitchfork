@@ -4,82 +4,16 @@ use crate::settings::SettingsPartial;
 use crate::settings::settings;
 use crate::state_file::StateFile;
 use crate::{Result, env};
-use humanbyte::HumanByte;
 use indexmap::IndexMap;
 use miette::Context;
 use schemars::JsonSchema;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::{Path, PathBuf};
 
-/// A byte-size type that accepts human-readable strings like "50MB", "1GiB", etc.
-///
-/// Backed by `u64` and uses the `humanbyte` crate for parsing and display.
-/// Used for `memory_limit` configuration in daemon definitions.
-#[derive(Clone, Copy, PartialEq, Eq, HumanByte)]
-pub struct MemoryLimit(pub u64);
-
-impl JsonSchema for MemoryLimit {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        std::borrow::Cow::Borrowed("MemoryLimit")
-    }
-
-    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        schemars::json_schema!({
-            "type": "string",
-            "description": "Memory limit in human-readable format, e.g. '50MB', '1GiB', '512KB'"
-        })
-    }
-}
-
-/// A CPU usage limit expressed as a percentage (e.g. `80.0` means 80% of one CPU core).
-///
-/// The supervisor periodically checks each daemon's CPU usage and kills processes
-/// that exceed this limit. Values above 100% are valid on multi-core systems
-/// (e.g. `200.0` allows up to 2 full cores).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CpuLimit(pub f32);
-
-impl std::fmt::Display for CpuLimit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}%", self.0)
-    }
-}
-
-impl Serialize for CpuLimit {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_f64(self.0 as f64)
-    }
-}
-
-impl<'de> Deserialize<'de> for CpuLimit {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let v = f64::deserialize(deserializer)?;
-        if v <= 0.0 {
-            return Err(serde::de::Error::custom("cpu_limit must be positive"));
-        }
-        Ok(CpuLimit(v as f32))
-    }
-}
-
-impl JsonSchema for CpuLimit {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        std::borrow::Cow::Borrowed("CpuLimit")
-    }
-
-    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        schemars::json_schema!({
-            "type": "number",
-            "description": "CPU usage limit as a percentage (e.g. 80 for 80% of one core, 200 for 2 cores)",
-            "exclusiveMinimum": 0
-        })
-    }
-}
+// Re-export config value types so existing `use crate::pitchfork_toml::X` paths keep working.
+pub use crate::config_types::{
+    CpuLimit, CronRetrigger, Dir, MemoryLimit, OnOutputHook, PitchforkTomlAuto, PitchforkTomlCron,
+    PitchforkTomlHooks, PortBump, PortConfig, Retry, StopConfig, StopSignal, WatchMode,
+};
 
 /// Raw slug entry as read from TOML (uses String for dir path).
 /// Format in global config:
@@ -146,10 +80,16 @@ struct PitchforkTomlDaemonRaw {
     pub ready_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ready_cmd: Option<String>,
+    /// New port configuration (preferred)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub port: Option<PortConfig>,
+    /// Deprecated: use `port` instead
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub expected_port: Vec<u16>,
+    /// Deprecated: use `port.bump` instead
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub auto_bump_port: Option<bool>,
+    /// Deprecated: use `port.bump` instead
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub port_bump_attempts: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -177,6 +117,9 @@ struct PitchforkTomlDaemonRaw {
     /// CPU usage limit as a percentage (e.g. 80 for 80%, 200 for 2 cores)
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cpu_limit: Option<CpuLimit>,
+    /// Unix signal to send for graceful shutdown (default: SIGTERM)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub stop_signal: Option<StopConfig>,
 }
 
 /// Configuration schema for pitchfork.toml daemon supervisor configuration files.
@@ -857,6 +800,33 @@ impl PitchforkToml {
                 depends.push(dep_id);
             }
 
+            // Resolve port config: prefer new `port` field, fall back to deprecated fields
+            let port = if let Some(port) = raw_daemon.port {
+                Some(port)
+            } else if !raw_daemon.expected_port.is_empty()
+                || raw_daemon.auto_bump_port.is_some()
+                || raw_daemon.port_bump_attempts.is_some()
+            {
+                warn!(
+                    "daemon {short_name}: expected_port/auto_bump_port/port_bump_attempts are deprecated, use [daemons.{short_name}.port] instead"
+                );
+                let bump = if raw_daemon.auto_bump_port.unwrap_or(false) {
+                    PortBump(
+                        raw_daemon
+                            .port_bump_attempts
+                            .unwrap_or_else(|| settings().default_port_bump_attempts()),
+                    )
+                } else {
+                    PortBump(0)
+                };
+                Some(PortConfig {
+                    expect: raw_daemon.expected_port,
+                    bump,
+                })
+            } else {
+                None
+            };
+
             let daemon = PitchforkTomlDaemon {
                 run: raw_daemon.run,
                 auto: raw_daemon.auto,
@@ -867,11 +837,7 @@ impl PitchforkToml {
                 ready_http: raw_daemon.ready_http,
                 ready_port: raw_daemon.ready_port,
                 ready_cmd: raw_daemon.ready_cmd,
-                expected_port: raw_daemon.expected_port,
-                auto_bump_port: raw_daemon.auto_bump_port.unwrap_or(false),
-                port_bump_attempts: raw_daemon
-                    .port_bump_attempts
-                    .unwrap_or_else(|| settings().default_port_bump_attempts()),
+                port,
                 boot_start: raw_daemon.boot_start,
                 depends,
                 watch: raw_daemon.watch,
@@ -883,6 +849,7 @@ impl PitchforkToml {
                 user: raw_daemon.user,
                 memory_limit: raw_daemon.memory_limit,
                 cpu_limit: raw_daemon.cpu_limit,
+                stop_signal: raw_daemon.stop_signal,
                 path: Some(path.to_path_buf()),
             };
             pt.daemons.insert(id, daemon);
@@ -960,6 +927,7 @@ impl PitchforkToml {
                         config_namespace
                     ));
                 }
+                let port = daemon.port.as_ref();
                 let raw_daemon = PitchforkTomlDaemonRaw {
                     run: daemon.run.clone(),
                     auto: daemon.auto.clone(),
@@ -970,9 +938,13 @@ impl PitchforkToml {
                     ready_http: daemon.ready_http.clone(),
                     ready_port: daemon.ready_port,
                     ready_cmd: daemon.ready_cmd.clone(),
-                    expected_port: daemon.expected_port.clone(),
-                    auto_bump_port: Some(daemon.auto_bump_port),
-                    port_bump_attempts: Some(daemon.port_bump_attempts),
+                    port: port.cloned(),
+                    // Deprecated fields: written for backward compatibility with older pitchfork versions
+                    expected_port: port.map(|p| p.expect.clone()).unwrap_or_default(),
+                    auto_bump_port: port.filter(|p| p.auto_bump()).map(|_| true),
+                    port_bump_attempts: port
+                        .filter(|p| p.auto_bump())
+                        .map(|p| p.max_bump_attempts()),
                     boot_start: daemon.boot_start,
                     // Preserve cross-namespace dependencies: use qualified ID if namespace differs,
                     // otherwise use short name
@@ -999,6 +971,7 @@ impl PitchforkToml {
                     user: daemon.user.clone(),
                     memory_limit: daemon.memory_limit,
                     cpu_limit: daemon.cpu_limit,
+                    stop_signal: daemon.stop_signal,
                 };
                 raw.daemons.insert(id.name().to_string(), raw_daemon);
             }
@@ -1127,92 +1100,8 @@ impl PitchforkToml {
     }
 }
 
-/// Hook triggered when the daemon produces output matching an optional pattern.
-///
-/// At most one of `filter` (substring) or `regex` (regular expression) may be
-/// specified.  When neither is given the hook fires on every line of output,
-/// subject to debouncing.
-///
-/// `debounce` is a humantime duration string (e.g. `"500ms"`, `"2s"`) that
-/// controls the minimum interval between successive firings. Defaults to
-/// `"1000ms"`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-pub struct OnOutputHook {
-    /// Command to run when the output condition is met
-    pub run: String,
-    /// Fire when a line of output contains this substring
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub filter: Option<String>,
-    /// Fire when a line of output matches this regular expression
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub regex: Option<String>,
-    /// Minimum time between successive firings (humantime, e.g. `"500ms"`).
-    /// Defaults to `"1000ms"`.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub debounce: Option<String>,
-}
-
-impl OnOutputHook {
-    /// Validate configuration: `filter` and `regex` are mutually exclusive,
-    /// `regex` must be a valid regular expression, and `debounce` (if present)
-    /// must be a valid humantime duration.
-    pub fn validate(&self, daemon_name: &str) -> crate::Result<()> {
-        if self.filter.is_some() && self.regex.is_some() {
-            miette::bail!(
-                "daemon {daemon_name}: on_output.filter and on_output.regex are mutually exclusive"
-            );
-        }
-        if let Some(ref pattern) = self.regex {
-            regex::Regex::new(pattern).map_err(|e| {
-                miette::miette!(
-                    "daemon {daemon_name}: on_output.regex {pattern:?} is not a valid regular expression: {e}"
-                )
-            })?;
-        }
-        if let Some(ref d) = self.debounce {
-            humantime::parse_duration(d).map_err(|e| {
-                miette::miette!(
-                    "daemon {daemon_name}: on_output.debounce {d:?} is not a valid duration: {e}"
-                )
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Resolved debounce duration. Falls back to 1 second.
-    pub fn debounce_duration(&self) -> std::time::Duration {
-        self.debounce
-            .as_deref()
-            .and_then(|s| humantime::parse_duration(s).ok())
-            .unwrap_or(std::time::Duration::from_millis(1000))
-    }
-}
-
-/// Lifecycle hooks for a daemon
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-pub struct PitchforkTomlHooks {
-    /// Command to run when the daemon becomes ready
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub on_ready: Option<String>,
-    /// Command to run when the daemon fails and all retries are exhausted
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub on_fail: Option<String>,
-    /// Command to run before each retry attempt
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub on_retry: Option<String>,
-    /// Command to run when the daemon is explicitly stopped by pitchfork
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub on_stop: Option<String>,
-    /// Command to run on any daemon termination (clean exit, crash, or stop)
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub on_exit: Option<String>,
-    /// Hook triggered when the daemon produces matching output
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub on_output: Option<OnOutputHook>,
-}
-
 /// Configuration for a single daemon (internal representation with DaemonId)
-#[derive(Debug, Clone, JsonSchema)]
+#[derive(Debug, Clone, JsonSchema, Default)]
 pub struct PitchforkTomlDaemon {
     /// The command to run. Prepend with 'exec' to avoid shell process overhead.
     #[schemars(example = example_run_command())]
@@ -1237,15 +1126,8 @@ pub struct PitchforkTomlDaemon {
     pub ready_port: Option<u16>,
     /// Shell command to poll for readiness (exit code 0 = ready)
     pub ready_cmd: Option<String>,
-    /// TCP ports the daemon is expected to bind to
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub expected_port: Vec<u16>,
-    /// Automatically find an available port if the specified port is in use
-    #[serde(default)]
-    pub auto_bump_port: bool,
-    /// Maximum number of port bump attempts when auto_bump_port is enabled (default: 10)
-    #[serde(default = "default_port_bump_attempts")]
-    pub port_bump_attempts: u32,
+    /// Port configuration: expected ports and auto-bump settings
+    pub port: Option<PortConfig>,
     /// Whether to start this daemon automatically on system boot
     pub boot_start: Option<bool>,
     /// List of daemon IDs that must be started before this one
@@ -1278,39 +1160,11 @@ pub struct PitchforkTomlDaemon {
     /// CPU usage limit as a percentage (e.g. 80 for 80%, 200 for 2 cores).
     /// The supervisor periodically monitors CPU usage and kills the process if it exceeds the limit.
     pub cpu_limit: Option<CpuLimit>,
+    /// Stop signal and optional per-daemon timeout. Accepts a signal name string
+    /// or `{ signal = "...", timeout = "..." }` object.
+    pub stop_signal: Option<StopConfig>,
     #[schemars(skip)]
     pub path: Option<PathBuf>,
-}
-
-impl Default for PitchforkTomlDaemon {
-    fn default() -> Self {
-        Self {
-            run: String::new(),
-            auto: Vec::new(),
-            cron: None,
-            retry: Retry::default(),
-            ready_delay: None,
-            ready_output: None,
-            ready_http: None,
-            ready_port: None,
-            ready_cmd: None,
-            expected_port: Vec::new(),
-            auto_bump_port: false,
-            port_bump_attempts: 10,
-            boot_start: None,
-            depends: Vec::new(),
-            watch: Vec::new(),
-            watch_mode: WatchMode::default(),
-            dir: None,
-            env: None,
-            hooks: None,
-            mise: None,
-            user: None,
-            memory_limit: None,
-            cpu_limit: None,
-            path: None,
-        }
-    }
 }
 
 impl PitchforkTomlDaemon {
@@ -1332,20 +1186,18 @@ impl PitchforkTomlDaemon {
             cmd,
             force: false,
             shell_pid: None,
-            dir,
+            dir: Dir(dir),
             autostop: self.auto.contains(&PitchforkTomlAuto::Stop),
             cron_schedule: self.cron.as_ref().map(|c| c.schedule.clone()),
             cron_retrigger: self.cron.as_ref().map(|c| c.retrigger),
-            retry: self.retry.count(),
+            retry: self.retry,
             retry_count: 0,
             ready_delay: self.ready_delay,
             ready_output: self.ready_output.clone(),
             ready_http: self.ready_http.clone(),
             ready_port: self.ready_port,
             ready_cmd: self.ready_cmd.clone(),
-            expected_port: self.expected_port.clone(),
-            auto_bump_port: self.auto_bump_port,
-            port_bump_attempts: self.port_bump_attempts,
+            port: self.port.clone(),
             wait_ready: false,
             depends: self.depends.clone(),
             env: self.env.clone(),
@@ -1360,182 +1212,13 @@ impl PitchforkTomlDaemon {
             user: self.user.clone(),
             memory_limit: self.memory_limit,
             cpu_limit: self.cpu_limit,
+            stop_signal: self.stop_signal,
             on_output_hook: self.hooks.as_ref().and_then(|h| h.on_output.clone()),
         }
     }
 }
 fn example_run_command() -> &'static str {
     "exec node server.js"
-}
-
-fn default_port_bump_attempts() -> u32 {
-    // Return a hardcoded default to avoid calling settings() during serde
-    // deserialization, which could cause a OnceLock re-entrancy deadlock.
-    // The runtime value from settings is applied later at each call site.
-    10
-}
-
-/// File watch backend mode for daemon `watch` patterns.
-#[derive(
-    Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq, JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum WatchMode {
-    /// Use platform-native watcher backend (inotify/FSEvents/ReadDirectoryChangesW).
-    #[default]
-    Native,
-    /// Use polling backend; more compatible on networked filesystems.
-    Poll,
-    /// Prefer native backend, fall back to polling when native watch setup fails.
-    Auto,
-}
-
-/// Cron scheduling configuration
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
-pub struct PitchforkTomlCron {
-    /// Cron expression (e.g., '0 * * * *' for hourly, '*/5 * * * *' for every 5 minutes)
-    #[schemars(example = example_cron_schedule())]
-    pub schedule: String,
-    /// Behavior when cron triggers while previous run is still active
-    #[serde(default = "default_retrigger")]
-    pub retrigger: CronRetrigger,
-}
-
-fn default_retrigger() -> CronRetrigger {
-    CronRetrigger::Finish
-}
-
-fn example_cron_schedule() -> &'static str {
-    "0 * * * *"
-}
-
-/// Retrigger behavior for cron-scheduled daemons
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum CronRetrigger {
-    /// Retrigger only if the previous run has finished (success or error)
-    Finish,
-    /// Always retrigger, stopping the previous run if still active
-    Always,
-    /// Retrigger only if the previous run succeeded
-    Success,
-    /// Retrigger only if the previous run failed
-    Fail,
-}
-
-/// Auto start/stop configuration
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PitchforkTomlAuto {
-    Start,
-    Stop,
-}
-
-/// Retry configuration that accepts either a boolean or a count.
-/// - `true` means retry indefinitely (u32::MAX)
-/// - `false` or `0` means no retries
-/// - A number means retry that many times
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
-pub struct Retry(pub u32);
-
-impl std::fmt::Display for Retry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.is_infinite() {
-            write!(f, "infinite")
-        } else {
-            write!(f, "{}", self.0)
-        }
-    }
-}
-
-impl Retry {
-    pub const INFINITE: Retry = Retry(u32::MAX);
-
-    pub fn count(&self) -> u32 {
-        self.0
-    }
-
-    pub fn is_infinite(&self) -> bool {
-        self.0 == u32::MAX
-    }
-}
-
-impl From<u32> for Retry {
-    fn from(n: u32) -> Self {
-        Retry(n)
-    }
-}
-
-impl From<bool> for Retry {
-    fn from(b: bool) -> Self {
-        if b { Retry::INFINITE } else { Retry(0) }
-    }
-}
-
-impl Serialize for Retry {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        // Serialize infinite as true, otherwise as number
-        if self.is_infinite() {
-            serializer.serialize_bool(true)
-        } else {
-            serializer.serialize_u32(self.0)
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for Retry {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        use serde::de::{self, Visitor};
-
-        struct RetryVisitor;
-
-        impl Visitor<'_> for RetryVisitor {
-            type Value = Retry;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a boolean or non-negative integer")
-            }
-
-            fn visit_bool<E>(self, v: bool) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(Retry::from(v))
-            }
-
-            fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                if v < 0 {
-                    Err(de::Error::custom("retry count cannot be negative"))
-                } else if v > u32::MAX as i64 {
-                    Ok(Retry::INFINITE)
-                } else {
-                    Ok(Retry(v as u32))
-                }
-            }
-
-            fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                if v > u32::MAX as u64 {
-                    Ok(Retry::INFINITE)
-                } else {
-                    Ok(Retry(v as u32))
-                }
-            }
-        }
-
-        deserializer.deserialize_any(RetryVisitor)
-    }
 }
 
 #[cfg(test)]
