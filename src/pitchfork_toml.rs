@@ -1038,6 +1038,27 @@ impl PitchforkToml {
         }
     }
 
+    /// Find the registered slug for a daemon using a pre-loaded slug registry.
+    pub fn find_slug_for_daemon_in_registry(
+        daemon_id: &DaemonId,
+        global_slugs: &IndexMap<String, SlugEntry>,
+    ) -> Option<String> {
+        global_slugs
+            .iter()
+            .find(|(slug, entry)| {
+                let daemon_name = entry.daemon.as_deref().unwrap_or(slug);
+                if daemon_id.name() != daemon_name {
+                    return false;
+                }
+
+                match Self::namespace_for_dir(&entry.dir) {
+                    Ok(namespace) => daemon_id.namespace() == namespace,
+                    Err(_) => true,
+                }
+            })
+            .map(|(slug, _)| slug.clone())
+    }
+
     /// Check if a slug is registered in the global config's `[slugs]` section.
     #[allow(dead_code)]
     pub fn is_slug_registered(slug: &str) -> bool {

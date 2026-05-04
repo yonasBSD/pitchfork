@@ -137,6 +137,11 @@ impl Start {
         };
 
         let result = ipc.start_daemons(&ids, opts).await?;
+        let global_slugs = settings()
+            .proxy
+            .enable
+            .then(PitchforkToml::read_global_slugs)
+            .unwrap_or_default();
 
         // Show startup logs for successful daemons (unless --quiet)
         if !self.quiet {
@@ -162,18 +167,11 @@ impl Start {
                     println!("  {} {} started", nstyle("✔").green(), nbold(id));
                 }
                 // Show proxy URL when the proxy is enabled and the daemon has a port.
-                // Look up slug from global config's [slugs] section.
                 let s = settings();
                 if s.proxy.enable && !resolved_ports.is_empty() {
-                    let global_slugs = PitchforkToml::read_global_slugs();
-                    let slug_name: Option<&str> = global_slugs
-                        .iter()
-                        .find(|(slug, entry)| {
-                            let daemon_name = entry.daemon.as_deref().unwrap_or(slug);
-                            id.name() == daemon_name
-                        })
-                        .map(|(slug, _)| slug.as_str());
-                    if let Some(proxy_url) = build_proxy_url(slug_name, s) {
+                    let slug_name =
+                        PitchforkToml::find_slug_for_daemon_in_registry(id, &global_slugs);
+                    if let Some(proxy_url) = build_proxy_url(slug_name.as_deref(), s) {
                         println!("    {} {}", ndim("↳"), ncyan(&proxy_url).underlined(),);
                     }
                 }
