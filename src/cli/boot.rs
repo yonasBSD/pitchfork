@@ -13,7 +13,7 @@ boots. Uses platform-specific mechanisms (launchd on macOS, systemd on Linux).
 
 When run as root (or via sudo), registers a system-level entry that starts
 pitchfork for all users:
-  macOS: /Library/LaunchAgents/pitchfork.plist
+  macOS: /Library/LaunchDaemons/pitchfork.plist
   Linux: /etc/systemd/system/pitchfork.service
 
 When run as a normal user, registers a user-level entry:
@@ -50,7 +50,7 @@ Enable boot start for pitchfork supervisor
 Registers pitchfork to start automatically when the system boots.
 
 When run as root (or via sudo): creates a system-level entry
-  macOS: /Library/LaunchAgents/pitchfork.plist
+  macOS: /Library/LaunchDaemons/pitchfork.plist
   Linux: /etc/systemd/system/pitchfork.service
 
 When run as a normal user: creates a user-level entry
@@ -100,6 +100,10 @@ impl BootEnable {
         let boot_manager = BootManager::new()?;
 
         if boot_manager.is_current_level_enabled()? {
+            // Even if already enabled, clean up any leftover legacy entry
+            // from a partial migration on a previous attempt.
+            #[cfg(target_os = "macos")]
+            boot_manager.cleanup_legacy(false)?;
             println!("Boot start is already enabled");
             return Ok(());
         }
@@ -122,8 +126,17 @@ impl BootDisable {
         }
 
         boot_manager.disable()?;
-        info!("✓ Boot start disabled");
 
+        // disable() skips entries the caller lacks privileges to remove;
+        // verify the result so we never report a false success.
+        if boot_manager.is_enabled()? {
+            miette::bail!(
+                "boot start could not be fully disabled; \
+                a system-level entry may require elevated privileges to remove"
+            );
+        }
+
+        info!("✓ Boot start disabled");
         Ok(())
     }
 }
@@ -135,12 +148,16 @@ impl BootStatus {
         let other_enabled = boot_manager.is_other_level_enabled()?;
 
         match (current_enabled, other_enabled) {
-            (true, true) => info!("Boot start is enabled at both user and system level"),
+            (true, true) => warn!(
+                "Boot start is enabled at both user and system level; \
+                run `pitchfork boot disable` (with appropriate privileges) to remove the unwanted entry"
+            ),
             (true, false) => info!("Boot start is enabled"),
             (false, true) => warn!(
                 "Boot start is registered at the other privilege level only; \
                 run `pitchfork boot disable` (with appropriate privileges) to clean it up"
             ),
+            (false, false) if boot_manager.is_enabled()? => info!("Boot start is enabled"),
             (false, false) => info!("Boot start is disabled"),
         }
 
